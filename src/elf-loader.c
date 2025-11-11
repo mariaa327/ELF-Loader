@@ -13,6 +13,12 @@
 #include <stdint.h>
 #include <sys/random.h>
 
+void push64(void **sp, Elf64_Addr v)
+{
+	*sp = (void *)((char *)(*sp) - 8);
+	*(Elf64_Addr *)(*sp) = v;
+}
+
 void *map_elf(const char *filename)
 {
 	struct stat st;
@@ -183,12 +189,7 @@ void load_and_run(const char *filename, int argc, char **argv, char **envp)
 	sp_val = (sp_val / 16) * 16;
 	void *sp = (void *)sp_val;
 
-// mini instructiune de push pentru a rezerva 8 bytes pe stack, se inlocuieste cu some_value si se actualizeaza sp
-#define PUSH64(v)                            \
-	do {                                     \
-		sp = (void *)((char *)sp - 8);   \
-		*(Elf64_Addr *)sp = (Elf64_Addr)(v); \
-	} while (0)
+
 
 	int env_count = 0; // pentru numararea variabilelor de mediu
 
@@ -243,46 +244,46 @@ void load_and_run(const char *filename, int argc, char **argv, char **envp)
 	void (*entry)(void) = (void (*)(void))(unsigned long)at_entry;
 
 	// auxv ordonat invers pe stack si terminat cu AT_NULL
-	PUSH64(0); // valoare pentru AT_NULL
-	PUSH64(AT_NULL); // marcheaza sfarsitul auxv
-	PUSH64(at_random_ptr); // pointer la cei 16 butes random
-	PUSH64(AT_RANDOM); // intrare AT_RANDOM
-	PUSH64((Elf64_Addr)page_size); // dimensiunea paginii
-	PUSH64(AT_PAGESZ);
-	PUSH64(at_entry); // adresa entry pointului ELF
-	PUSH64(AT_ENTRY);
-	PUSH64((Elf64_Addr)ehdr->e_phnum); // numarul de program headers
-	PUSH64(AT_PHNUM);
-	PUSH64((Elf64_Addr)sizeof(Elf64_Phdr)); // dimensiunea unui program header
-	PUSH64(AT_PHENT);
+	push64(&sp, 0); // valoare pentru AT_NULL
+	push64(&sp, AT_NULL); // marcheaza sfarsitul auxv
+	push64(&sp, at_random_ptr); // pointer la cei 16 butes random
+	push64(&sp, AT_RANDOM); // intrare AT_RANDOM
+	push64(&sp, (Elf64_Addr)page_size); // dimensiunea paginii
+	push64(&sp, AT_PAGESZ);
+	push64(&sp, at_entry); // adresa entry pointului ELF
+	push64(&sp, AT_ENTRY);
+	push64(&sp, (Elf64_Addr)ehdr->e_phnum); // numarul de program headers
+	push64(&sp, AT_PHNUM);
+	push64(&sp, (Elf64_Addr)sizeof(Elf64_Phdr)); // dimensiunea unui program header
+	push64(&sp, AT_PHENT);
 	if (at_phdr) {
-		PUSH64(at_phdr); // adresa in memorie a program header table
-		PUSH64(AT_PHDR);
+		push64(&sp, at_phdr); // adresa in memorie a program header table
+		push64(&sp, AT_PHDR);
 	}
-	PUSH64((Elf64_Addr)geteuid()); // effictive UID
-	PUSH64(AT_EUID);
-	PUSH64((Elf64_Addr)getuid()); // real UID
-	PUSH64(AT_UID);
-	PUSH64((Elf64_Addr)getegid()); // effective GID
-	PUSH64(AT_EGID);
-	PUSH64((Elf64_Addr)getgid()); // real GID
-	PUSH64(AT_GID);
+	push64(&sp, (Elf64_Addr)geteuid()); // effictive UID
+	push64(&sp, AT_EUID);
+	push64(&sp, (Elf64_Addr)getuid()); // real UID
+	push64(&sp, AT_UID);
+	push64(&sp, (Elf64_Addr)getegid()); // effective GID
+	push64(&sp, AT_EGID);
+	push64(&sp, (Elf64_Addr)getgid()); // real GID
+	push64(&sp, AT_GID);
 
-	PUSH64(0); // NULL dupa envp
+	push64(&sp, 0); // NULL dupa envp
 
 	// envp in ordine inversa
 	for (int i = env_count - 1; i >= 0; i--)
-		PUSH64((Elf64_Addr)(unsigned long)envp[i]);
+		push64(&sp, (Elf64_Addr)(unsigned long)envp[i]);
 
 	// NULL dupa argv
-	PUSH64(0);
+	push64(&sp, 0);
 
 	// primul argument: calea ELF-ului
 	for (int i = argc - 1; i >= 0; i--)
-		PUSH64((Elf64_Addr)(unsigned long)argv[i]);
+		push64(&sp, (Elf64_Addr)(unsigned long)argv[i]);
 
 	// argc
-	PUSH64((Elf64_Addr)argc);
+	push64(&sp, (Elf64_Addr)argc);
 
 	__asm__ __volatile__(
 		"mov %0, %%rsp\n"
