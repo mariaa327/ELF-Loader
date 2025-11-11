@@ -8,10 +8,13 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <elf.h>
+#include <string.h>
+#include <stdint.h>
+#include <sys/random.h>
 
 void *map_elf(const char *filename)
 {
-	// This part helps you store the content of the ELF file inside the buffer.
 	struct stat st;
 	void *file;
 	int fd;
@@ -36,51 +39,253 @@ void *map_elf(const char *filename)
 
 void load_and_run(const char *filename, int argc, char **argv, char **envp)
 {
-	// Contents of the ELF file are in the buffer: elf_contents[x] is the x-th byte of the ELF file.
 	void *elf_contents = map_elf(filename);
+	Elf64_Ehdr *ehdr = (Elf64_Ehdr *)elf_contents; // header elf 64-bit de la inceputul fisierului
+	Elf64_Phdr *phdr = (Elf64_Phdr *)((char *)elf_contents + ehdr->e_phoff); // inceput program headers
 
-	/**
-	 * TODO: ELF Header Validation
-	 * Validate ELF magic bytes - "Not a valid ELF file" + exit code 3 if invalid.
-	 * Validate ELF class is 64-bit (ELFCLASS64) - "Not a 64-bit ELF" + exit code 4 if invalid.
-	 */
+	size_t page_size = (size_t)sysconf(_SC_PAGESIZE); // dimensiunea paginii de memorie
 
-	/**
-	 * TODO: Load PT_LOAD segments
-	 * For minimal syscall-only binaries.
-	 * For each PT_LOAD segment:
-	 * - Map the segments in memory. Permissions can be RWX for now.
-	 */
+	// task1
 
-	/**
-	 * TODO: Load Memory Regions with Correct Permissions
-	 * For each PT_LOAD segment:
-	 *	- Set memory permissions according to program header p_flags (PF_R, PF_W, PF_X).
-	 *	- Use mprotect() or map with the correct permissions directly using mmap().
-	 */
+	if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
+	    ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
+	    ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
+	    ehdr->e_ident[EI_MAG3] != ELFMAG3) {
+		fprintf(stderr, "Not a valid ELF file\n"); // verific ELF
+		exit(3);
+	}
 
-	/**
-	 * TODO: Support Static Non-PIE Binaries with libc
-	 * Must set up a valid process stack, including:
-	 *	- argc, argv, envp
-	 *	- auxv vector (with entries like AT_PHDR, AT_PHENT, AT_PHNUM, etc.)
-	 * Note: Beware of the AT_RANDOM, AT_PHDR entries, the application will crash if you do not set them up properly.
-	 */
-	void *sp = NULL;
+	// accept doar ELF 64-bit
+	if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+		fprintf(stderr, "Not a 64-bit ELF\n");
+		exit(4);
+	}
 
-	/**
-	 * TODO: Support Static PIE Executables
-	 * Map PT_LOAD segments at a random load base.
-	 * Adjust virtual addresses of segments and entry point by load_base.
-	 * Stack setup (argc, argv, envp, auxv) same as above.
-	 */
+	// accept doar executabile si ET_DYN (pentru task5)
+	if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN)
+		exit(2);
 
-	// TODO: Set the entry point and the stack pointer
-	void (*entry)() = NULL;
+	// task5
+	Elf64_Addr base_addr = 0; // pentru ET_EXEC ramane 0
 
-	// Transfer control
+	if (ehdr->e_type == ET_DYN) {
+		Elf64_Addr min_addr = (Elf64_Addr)-1; // cel mai mic p_vaddr din PT_LOAD
+		Elf64_Addr max_addr = 0; // cel mai mare capăt (p_vaddr + p_memsz)
+
+		// calculez intervalul total de adrese acoperit de segmentele PT_LOAD
+		for (int i = 0; i < ehdr->e_phnum; i++) {
+			Elf64_Phdr *ph = &phdr[i];
+
+			if (ph->p_type != PT_LOAD)
+				continue;
+
+			Elf64_Addr s = ph->p_vaddr;
+			Elf64_Addr e = s + ph->p_memsz;
+
+			if (s < min_addr)
+				min_addr = s;
+			if (e > max_addr)
+				max_addr = e;
+		}
+
+		// ET_DYN fara PT_LOAD nu are sens
+		if (min_addr == (Elf64_Addr)-1)
+			exit(2);
+
+		Elf64_Addr map_start = (Elf64_Addr)((min_addr / page_size) * page_size); // adresa de inceput a paginii care contine min_addr (aliniere in jos)
+
+		size_t total_size = (size_t)(max_addr - map_start); // lungimea totala si rotunjesc in sus la pagina
+
+		if (total_size % page_size != 0)
+			total_size = ((total_size / page_size) + 1) * page_size;
+
+		// rezerv memorie pentru intreg intervalul [min_addr, max_addr)
+		void *probe = mmap(NULL, total_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+		if (probe == MAP_FAILED) {
+			perror("mmap");
+			exit(2);
+		}
+
+		base_addr = (Elf64_Addr)(unsigned long)probe - map_start; // unde am rezervat-unde ar fi vrut ELF-ul sa inceapa
+	}
+
+	// task2 si task3
+
+	for (int i = 0; i < ehdr->e_phnum; i++) {
+		Elf64_Phdr *ph = &phdr[i]; // pointer la program header-ul curent
+
+		if (ph->p_type != PT_LOAD)
+			continue; // se ignora segmenetele non-load
+
+		// adresa virtuala dorita dupa realocare
+		Elf64_Addr vaddr = ph->p_vaddr + base_addr;
+
+		// inceput segment aliniat in jos la pagina
+		Elf64_Addr seg_start = (Elf64_Addr)((vaddr / page_size) * page_size);
+
+		size_t offset_in_page = (size_t)(vaddr - seg_start); // cat sa sarim de la inceputul paginii pana la segment
+		size_t map_needed = offset_in_page + ph->p_memsz; // tot ce trebuie in memorie
+
+		// lungime mapata rotunjita in sus la multiplu de pagina
+		size_t map_len = map_needed;
+
+		if (map_len % page_size != 0)
+			map_len = ((map_len / page_size) + 1) * page_size;
+
+		// mapez memorie anonima la adresa calculata (MAP_FIXED)
+		void *mapped = mmap((void *)seg_start, map_len, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+
+		if (mapped == MAP_FAILED) {
+			perror("mmap");
+			exit(2);
+		}
+
+		// copiez continutul segementului din fisier daca exista
+		if (ph->p_filesz > 0)
+			memcpy((char *)mapped + offset_in_page, (char *)elf_contents + ph->p_offset, (size_t)ph->p_filesz);
+
+		// umplu cu 0 restul fisierului
+		if (ph->p_memsz > ph->p_filesz)
+			memset((char *)mapped + offset_in_page + ph->p_filesz, 0, (size_t)(ph->p_memsz - ph->p_filesz));
+
+		// calculez permisiunile finale
+		int prot = 0;
+
+		if (ph->p_flags & PF_R)
+			prot |= PROT_READ;
+		if (ph->p_flags & PF_W)
+			prot |= PROT_WRITE;
+		if (ph->p_flags & PF_X)
+			prot |= PROT_EXEC;
+
+		// aplic permisiunile corecte
+		if (mprotect((void *)seg_start, map_len, prot) != 0) {
+			perror("mprotect");
+			exit(2);
+		}
+	}
+
+	// task 4 si 5 (pentru stiva si auxv cu base_addr)
+
+	size_t stack_size = 8 * 1024 * 1024; // 8MB stack pentru programul incarcat
+
+	void *stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+
+	if (stack == MAP_FAILED) {
+		perror("mmap");
+		exit(1);
+	}
+
+	// rsp porneste de la varful stack-ului aliniat la 16 bytes
+	unsigned long sp_val = (unsigned long)stack + stack_size;
+
+	sp_val = (sp_val / 16) * 16;
+	void *sp = (void *)sp_val;
+
+// mini instructiune de push pentru a rezerva 8 bytes pe stack, se inlocuieste cu some_value si se actualizeaza sp
+#define PUSH64(v)                            \
+	do {                                     \
+		sp = (void *)((char *)sp - 8);   \
+		*(Elf64_Addr *)sp = (Elf64_Addr)(v); \
+	} while (0)
+
+	int env_count = 0; // pentru numararea variabilelor de mediu
+
+	while (envp && envp[env_count])
+		env_count++;
+
+	// AT_RANDOM: pentru comportament kernelului
+	sp = (void *)((char *)sp - 16);
+	unsigned char *at_rand_area = (unsigned char *)sp;
+
+	ssize_t gr = getrandom(at_rand_area, 16, 0); // pun 16 bytes random pe stack si tin pointerul in auxv
+
+	if (gr != 16)
+		exit(2);
+	Elf64_Addr at_random_ptr = (Elf64_Addr)(unsigned long)at_rand_area;
+
+	// calculez adresa in memorie a vectorului de program headers
+	Elf64_Addr at_phdr = 0; // adresa finala
+	Elf64_Off ph_tbl_off = ehdr->e_phoff; // offsetul tabelei de program headers
+	Elf64_Xword ph_tbl_len = (Elf64_Xword)ehdr->e_phnum * ehdr->e_phentsize; // dimensiunea totala a program table header
+
+	for (int i = 0; i < ehdr->e_phnum && !at_phdr; i++) {
+		Elf64_Phdr *ph = &phdr[i]; // program header curent
+
+		// doar segmentele incarcate
+		if (ph->p_type != PT_LOAD)
+			continue;
+
+		Elf64_Off fstart = ph->p_offset; // inceputul segmentului in fisier
+		Elf64_Off fend = ph->p_offset + ph->p_filesz; // sfarsitul segmentului din fisier
+
+		// verific daca intreaga tabela se ala in interiorul acestui segment PT_LOAD
+		if (ph_tbl_off >= fstart && (ph_tbl_off + ph_tbl_len) <= fend)
+			at_phdr = ph->p_vaddr + (ph_tbl_off - fstart); // se calculeaza adresa virtuala corespunzatoare PHT in memorie
+	}
+
+	// daca nu am gasit in PT_LOAD caut
+	if (!at_phdr) {
+		for (int i = 0; i < ehdr->e_phnum; i++) {
+			if (phdr[i].p_type == PT_PHDR) {
+				at_phdr = phdr[i].p_vaddr;
+				break;
+			}
+		}
+	}
+
+	if (at_phdr)
+		at_phdr += base_addr; // ajustez cu base_addr pentru ET_DYN
+
+	// entry point efectiv (realocat)
+	Elf64_Addr at_entry = ehdr->e_entry + base_addr;
+	void (*entry)(void) = (void (*)(void))(unsigned long)at_entry;
+
+	// auxv ordonat invers pe stack si terminat cu AT_NULL
+	PUSH64(0); // valoare pentru AT_NULL
+	PUSH64(AT_NULL); // marcheaza sfarsitul auxv
+	PUSH64(at_random_ptr); // pointer la cei 16 butes random
+	PUSH64(AT_RANDOM); // intrare AT_RANDOM
+	PUSH64((Elf64_Addr)page_size); // dimensiunea paginii
+	PUSH64(AT_PAGESZ);
+	PUSH64(at_entry); // adresa entry pointului ELF
+	PUSH64(AT_ENTRY);
+	PUSH64((Elf64_Addr)ehdr->e_phnum); // numarul de program headers
+	PUSH64(AT_PHNUM);
+	PUSH64((Elf64_Addr)sizeof(Elf64_Phdr)); // dimensiunea unui program header
+	PUSH64(AT_PHENT);
+	if (at_phdr) {
+		PUSH64(at_phdr); // adresa in memorie a program header table
+		PUSH64(AT_PHDR);
+	}
+	PUSH64((Elf64_Addr)geteuid()); // effictive UID
+	PUSH64(AT_EUID);
+	PUSH64((Elf64_Addr)getuid()); // real UID
+	PUSH64(AT_UID);
+	PUSH64((Elf64_Addr)getegid()); // effective GID
+	PUSH64(AT_EGID);
+	PUSH64((Elf64_Addr)getgid()); // real GID
+	PUSH64(AT_GID);
+
+	PUSH64(0); // NULL dupa envp
+
+	// envp in ordine inversa
+	for (int i = env_count - 1; i >= 0; i--)
+		PUSH64((Elf64_Addr)(unsigned long)envp[i]);
+
+	// NULL dupa argv
+	PUSH64(0);
+
+	// primul argument: calea ELF-ului
+	for (int i = argc - 1; i >= 0; i--)
+		PUSH64((Elf64_Addr)(unsigned long)argv[i]);
+
+	// argc
+	PUSH64((Elf64_Addr)argc);
+
 	__asm__ __volatile__(
-			"mov %0, %%rsp\n"
+		"mov %0, %%rsp\n"
 			"xor %%rbp, %%rbp\n"
 			"jmp *%1\n"
 			:
